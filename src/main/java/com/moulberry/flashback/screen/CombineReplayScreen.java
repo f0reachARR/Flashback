@@ -1,13 +1,8 @@
 package com.moulberry.flashback.screen;
 
-import com.mojang.serialization.Lifecycle;
 import com.moulberry.flashback.Flashback;
-import com.moulberry.flashback.FlashbackGson;
 import com.moulberry.flashback.exporting.AsyncFileDialogs;
 import com.moulberry.flashback.io.ReplayCombiner;
-import com.moulberry.flashback.playback.EmptyLevelSource;
-import com.moulberry.flashback.record.FlashbackMeta;
-import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
@@ -15,48 +10,14 @@ import net.minecraft.client.gui.components.StringWidget;
 import net.minecraft.client.gui.layouts.FrameLayout;
 import net.minecraft.client.gui.layouts.GridLayout;
 import net.minecraft.client.gui.screens.AlertScreen;
-import net.minecraft.client.gui.screens.ConfirmScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.TitleScreen;
-import net.minecraft.commands.Commands;
-import net.minecraft.core.Holder;
-import net.minecraft.core.MappedRegistry;
-import net.minecraft.core.Registry;
-import net.minecraft.core.RegistryAccess;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
-import net.minecraft.server.WorldLoader;
-import net.minecraft.server.WorldStem;
-import net.minecraft.server.packs.repository.PackRepository;
-import net.minecraft.server.packs.repository.ServerPacksSource;
-import net.minecraft.world.Difficulty;
-import net.minecraft.world.flag.FeatureFlagSet;
-import net.minecraft.world.flag.FeatureFlags;
-import net.minecraft.world.level.DataPackConfig;
-import net.minecraft.world.level.GameRules;
-import net.minecraft.world.level.GameType;
-import net.minecraft.world.level.LevelSettings;
-import net.minecraft.world.level.WorldDataConfiguration;
-import net.minecraft.world.level.biome.Biome;
-import net.minecraft.world.level.biome.Biomes;
-import net.minecraft.world.level.dimension.BuiltinDimensionTypes;
-import net.minecraft.world.level.dimension.DimensionType;
-import net.minecraft.world.level.dimension.LevelStem;
-import net.minecraft.world.level.levelgen.WorldDimensions;
-import net.minecraft.world.level.levelgen.WorldOptions;
-import net.minecraft.world.level.storage.LevelStorageSource;
-import net.minecraft.world.level.storage.PrimaryLevelData;
 import org.jetbrains.annotations.Nullable;
 
-import java.io.IOException;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 public class CombineReplayScreen extends Screen {
@@ -152,34 +113,19 @@ public class CombineReplayScreen extends Screen {
 
         rowHelper.addChild(new BottomTextWidget(204, 10, Component.literal(""), this.font), 2);
 
+        rowHelper.addChild(Button.builder(Component.translatable("flashback.combine_replay.combine_multiple"), button -> {
+            Minecraft.getInstance().setScreen(new CombineMultipleReplaysScreen(this.lastScreen, this.firstReplay));
+        }).width(204).build(), 2);
+
+        rowHelper.addChild(new BottomTextWidget(204, 10, Component.literal(""), this.font), 2);
+
         rowHelper.addChild(Button.builder(Component.translatable("flashback.combine_replay.do_combine"), button -> {
             try {
-                PackRepository packRepository = ServerPacksSource.createVanillaTrustedRepository();
-                packRepository.reload();
-
-                WorldDataConfiguration worldDataConfiguration = new WorldDataConfiguration(new DataPackConfig(List.of(), List.of()), FeatureFlags.DEFAULT_FLAGS);
-                LevelSettings levelSettings = new LevelSettings("Replay", GameType.SPECTATOR, false, Difficulty.NORMAL, true, new GameRules(FeatureFlagSet.of()),
-                        worldDataConfiguration);
-                WorldLoader.PackConfig packConfig = new WorldLoader.PackConfig(packRepository, worldDataConfiguration, false, true);
-                WorldLoader.InitConfig initConfig = new WorldLoader.InitConfig(packConfig, Commands.CommandSelection.DEDICATED, 4);
-
-                WorldStem worldStem = Util.blockUntilDone(executor -> WorldLoader.load(initConfig, dataLoadContext -> {
-                    Registry<LevelStem> registry = new MappedRegistry<>(Registries.LEVEL_STEM, Lifecycle.stable()).freeze();
-
-                    Holder.Reference<Biome> plains = dataLoadContext.datapackWorldgen().lookupOrThrow(Registries.BIOME).get(Biomes.PLAINS).get();
-                    Holder.Reference<DimensionType> overworld = dataLoadContext.datapackWorldgen().lookupOrThrow(Registries.DIMENSION_TYPE).get(BuiltinDimensionTypes.OVERWORLD).get();
-
-                    WorldDimensions worldDimensions = new WorldDimensions(Map.of(LevelStem.OVERWORLD, new LevelStem(overworld, new EmptyLevelSource(plains))));
-                    WorldDimensions.Complete complete = worldDimensions.bake(registry);
-
-                    return new WorldLoader.DataLoadOutput<>(new PrimaryLevelData(levelSettings, new WorldOptions(0L, false, false),
-                        complete.specialWorldProperty(), complete.lifecycle()), complete.dimensionsRegistryAccess());
-                }, WorldStem::new, Util.backgroundExecutor(), executor)).get();
-
-                ReplayCombiner.combine(worldStem.registries().compositeAccess(), this.newReplayName, this.firstReplay, this.secondReplay, this.output);
+                ReplayCombiner.combine(this.newReplayName,
+                    List.of(this.firstReplay, this.secondReplay),
+                    this.output,
+                    false);
                 Minecraft.getInstance().setScreen(new TitleScreen());
-
-                worldStem.close();
             } catch (Exception e) {
                 Flashback.LOGGER.error("Error combining replays", e);
                 Minecraft.getInstance().setScreen(new AlertScreen(() -> Minecraft.getInstance().setScreen(this.lastScreen),
