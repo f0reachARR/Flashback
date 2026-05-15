@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.FlashbackGson;
 import com.moulberry.flashback.action.Action;
+import com.moulberry.flashback.action.ActionConfigurationPacket;
 import com.moulberry.flashback.action.ActionLevelChunkCached;
 import com.moulberry.flashback.action.ActionRegistry;
 import com.moulberry.flashback.playback.ReplayChunkCache;
@@ -34,6 +35,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -88,13 +90,16 @@ public class ReplayCombiner {
             throw new IllegalArgumentException("Need at least 1 input replay to combine");
         }
 
-        // Pre-pass: compute the chunk-area signature of every input so we can
-        // decide where to split before we start writing.
-        List<LongSet> signatures = new ArrayList<>(inputs.size());
+        // Pre-pass: compute the chunk-area signature and the snapshot configuration
+        // signature of every input so we can decide where to split before we start
+        // writing.
+        List<LongSet> chunkSignatures = new ArrayList<>(inputs.size());
+        List<byte[]> configSignatures = new ArrayList<>(inputs.size());
         for (Path input : inputs) {
-            signatures.add(computeChunkSignature(input));
+            chunkSignatures.add(computeChunkSignature(input));
+            configSignatures.add(computeConfigurationSignature(input));
         }
-        List<List<Path>> runs = groupByCompatibility(inputs, signatures);
+        List<List<Path>> runs = groupByCompatibility(inputs, chunkSignatures, configSignatures);
 
         List<Path> written = new ArrayList<>(runs.size());
         for (int i = 0; i < runs.size(); i++) {
@@ -104,7 +109,7 @@ public class ReplayCombiner {
         }
 
         if (runs.size() > 1) {
-            Flashback.LOGGER.info("Split combiner output into {} parts due to chunk-area changes between inputs", runs.size());
+            Flashback.LOGGER.info("Split combiner output into {} parts; see preceding warnings for the per-boundary reason", runs.size());
         }
         return written;
     }
@@ -281,6 +286,77 @@ public class ReplayCombiner {
     }
 
     /**
+     * SHA-256 digest of the concatenated payloads of every
+     * {@link ActionConfigurationPacket} action found in the first
+     * {@code .flashback} chunk's snapshot section. Returns an empty array if
+     * the replay has no chunks or no configuration actions; see
+     * {@link #configMatches}, which treats an empty signature as wildcard.
+     */
+    private static byte[] computeConfigurationSignature(Path replayPath) throws IOException {
+        try (FileSystem fs = FileSystems.newFileSystem(replayPath)) {
+            FlashbackMeta meta = readMetadata(fs);
+            if (meta.chunks.isEmpty()) {
+                return new byte[0];
+            }
+            String firstChunkName = meta.chunks.keySet().iterator().next();
+            Path chunkPath = fs.getPath("/" + firstChunkName);
+            if (!Files.exists(chunkPath)) {
+                return new byte[0];
+            }
+            byte[] bytes = Files.readAllBytes(chunkPath);
+            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(bytes));
+
+            int magic = buf.readInt();
+            if (magic != Flashback.MAGIC) {
+                return new byte[0];
+            }
+            int actionCount = buf.readVarInt();
+            int configurationPacketActionId = -1;
+            for (int i = 0; i < actionCount; i++) {
+                ResourceLocation actionName = buf.readResourceLocation();
+                Action action = ActionRegistry.getAction(actionName);
+                if (action instanceof ActionConfigurationPacket) {
+                    configurationPacketActionId = i;
+                }
+            }
+            if (configurationPacketActionId == -1) {
+                return new byte[0];
+            }
+            int snapshotSize = buf.readInt();
+            if (snapshotSize <= 0) {
+                return new byte[0];
+            }
+            int snapshotEnd = buf.readerIndex() + snapshotSize;
+
+            MessageDigest digest = newSha256();
+            byte[] tmp = new byte[8192];
+            boolean anyFound = false;
+            while (buf.readerIndex() < snapshotEnd) {
+                int id = buf.readVarInt();
+                int size = buf.readInt();
+                if (id == configurationPacketActionId) {
+                    anyFound = true;
+                    // Mix in a length prefix so concatenation is unambiguous.
+                    digest.update((byte) (size >>> 24));
+                    digest.update((byte) (size >>> 16));
+                    digest.update((byte) (size >>> 8));
+                    digest.update((byte) size);
+                    int remaining = size;
+                    while (remaining > 0) {
+                        int chunk = Math.min(remaining, tmp.length);
+                        buf.readBytes(tmp, 0, chunk);
+                        digest.update(tmp, 0, chunk);
+                        remaining -= chunk;
+                    }
+                } else {
+                    buf.skipBytes(size);
+                }
+            }
+            return anyFound ? digest.digest() : new byte[0];
+        }
+    }
+
+    /**
      * Parse the (chunkX, chunkZ) header of a level_chunk_caches packet.
      * Format: varint packetId, int32 chunkX, int32 chunkZ, ... (see
      * {@code ClientboundLevelChunkWithLightPacket}). Returns {@link Long#MIN_VALUE}
@@ -314,32 +390,62 @@ public class ReplayCombiner {
 
     /**
      * Walk the inputs in order and split them into maximal consecutive sub-lists
-     * whose adjacent chunk-area signatures meet {@link #SAME_RANGE_JACCARD}.
+     * whose adjacent chunk-area signatures meet {@link #SAME_RANGE_JACCARD} AND
+     * whose snapshot configuration signatures match exactly. A mismatch on
+     * either condition triggers a split with a warning that names the reason.
      */
-    private static List<List<Path>> groupByCompatibility(List<Path> inputs, List<LongSet> signatures) {
+    private static List<List<Path>> groupByCompatibility(List<Path> inputs, List<LongSet> chunkSigs, List<byte[]> configSigs) {
         List<List<Path>> runs = new ArrayList<>();
         List<Path> current = new ArrayList<>();
         current.add(inputs.get(0));
-        LongSet currentSig = signatures.get(0);
+        LongSet currentChunkSig = chunkSigs.get(0);
+        byte[] currentConfigSig = configSigs.get(0);
         for (int i = 1; i < inputs.size(); i++) {
-            LongSet sig = signatures.get(i);
-            double similarity = jaccard(currentSig, sig);
-            if (similarity >= SAME_RANGE_JACCARD) {
+            LongSet chunkSig = chunkSigs.get(i);
+            byte[] configSig = configSigs.get(i);
+            double similarity = jaccard(currentChunkSig, chunkSig);
+            boolean chunkMatches = similarity >= SAME_RANGE_JACCARD;
+            boolean configMatches = configMatches(currentConfigSig, configSig);
+            if (chunkMatches && configMatches) {
                 current.add(inputs.get(i));
-                // Keep the first non-empty signature as the run's reference so that
+                // Keep the first non-empty signatures as the run's reference so that
                 // an empty input mid-run doesn't reset the comparison baseline.
-                if (currentSig.isEmpty() && !sig.isEmpty()) {
-                    currentSig = sig;
+                if (currentChunkSig.isEmpty() && !chunkSig.isEmpty()) {
+                    currentChunkSig = chunkSig;
+                }
+                if (currentConfigSig.length == 0 && configSig.length != 0) {
+                    currentConfigSig = configSig;
                 }
             } else {
+                String reason;
+                if (!chunkMatches && !configMatches) {
+                    reason = String.format("chunk-area changed (Jaccard %.2f < %.2f) and snapshot configuration changed", similarity, SAME_RANGE_JACCARD);
+                } else if (!chunkMatches) {
+                    reason = String.format("chunk-area changed (Jaccard %.2f < %.2f)", similarity, SAME_RANGE_JACCARD);
+                } else {
+                    reason = "snapshot configuration (registries/tags/features) changed";
+                }
+                Flashback.LOGGER.warn("Splitting combiner output before input #{} ({}): {}", i, inputs.get(i).getFileName(), reason);
                 runs.add(current);
                 current = new ArrayList<>();
                 current.add(inputs.get(i));
-                currentSig = sig;
+                currentChunkSig = chunkSig;
+                currentConfigSig = configSig;
             }
         }
         runs.add(current);
         return runs;
+    }
+
+    /**
+     * Empty config signature on either side is treated as a wildcard (no
+     * snapshot recorded for that input — typically a tiny replay).
+     */
+    private static boolean configMatches(byte[] a, byte[] b) {
+        if (a.length == 0 || b.length == 0) {
+            return true;
+        }
+        return Arrays.equals(a, b);
     }
 
     /**
