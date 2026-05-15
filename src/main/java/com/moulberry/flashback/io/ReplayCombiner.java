@@ -24,19 +24,21 @@ import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.zip.CRC32C;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -128,11 +130,12 @@ public class ReplayCombiner {
              ZipOutputStream zipOut = new ZipOutputStream(bos)) {
             zipOut.setLevel(Deflater.BEST_SPEED);
 
-            CacheWriter cacheWriter = new CacheWriter(zipOut, dedupeChunkCaches);
-            // Only populated when dedupeChunkCaches is true.
-            HashMap<Long, List<int[]>> seenHashToIndex = dedupeChunkCaches ? new HashMap<>() : null;
-            // Buffer reused for hashing if dedup is on.
-            CRC32C crc = dedupeChunkCaches ? new CRC32C() : null;
+            CacheWriter cacheWriter = new CacheWriter(zipOut);
+            // SHA-256 digest -> global index. Wrapped in ByteBuffer so the byte[] works as a map key.
+            // Collision probability is negligible (2^-256), so we no longer keep packet bytes around
+            // for byte-equality verification — that was the previous memory hot spot.
+            HashMap<ByteBuffer, Integer> seenHashToIndex = dedupeChunkCaches ? new HashMap<>() : null;
+            MessageDigest sha = dedupeChunkCaches ? newSha256() : null;
 
             int flashbackChunkSeq = 0;
 
@@ -188,26 +191,15 @@ public class ReplayCombiner {
                     readEachCachePacket(fs, (localIndex, packetBytes) -> {
                         int globalIndex;
                         if (dedupeChunkCaches) {
-                            crc.reset();
-                            crc.update(packetBytes, 0, packetBytes.length);
-                            long h = crc.getValue();
-                            List<int[]> bucket = seenHashToIndex.get(h);
-                            int existing = -1;
-                            if (bucket != null) {
-                                // Linear scan within hash bucket to confirm true byte equality.
-                                for (int[] cand : bucket) {
-                                    if (cand[0] == packetBytes.length && cacheWriter.equalsAt(cand[1], packetBytes)) {
-                                        existing = cand[1];
-                                        break;
-                                    }
-                                }
-                            }
-                            if (existing >= 0) {
+                            sha.reset();
+                            sha.update(packetBytes);
+                            ByteBuffer key = ByteBuffer.wrap(sha.digest());
+                            Integer existing = seenHashToIndex.get(key);
+                            if (existing != null) {
                                 globalIndex = existing;
                             } else {
                                 globalIndex = cacheWriter.appendAndReturnIndex(packetBytes);
-                                seenHashToIndex.computeIfAbsent(h, k -> new ArrayList<>())
-                                    .add(new int[] { packetBytes.length, globalIndex });
+                                seenHashToIndex.put(key, globalIndex);
                             }
                         } else {
                             globalIndex = cacheWriter.appendAndReturnIndex(packetBytes);
@@ -543,25 +535,17 @@ public class ReplayCombiner {
     /**
      * Bucket-aware writer that streams level_chunk_caches/&lt;bucket&gt; entries
      * directly to the ZipOutputStream as packets are appended (no per-bucket
-     * heap buffer). Also retains packet bytes so {@link #equalsAt} can confirm
-     * hash matches when dedup is on.
+     * heap buffer, no retained packet bytes).
      */
     private static final class CacheWriter {
         private final ZipOutputStream out;
-        private final boolean retainForDedup;
         private final byte[] sizeHeader = new byte[4];
         private int totalCount = 0;
         private int currentBucket = -1;
         private boolean entryOpen = false;
-        // For dedup byte-equality verification: stores all packet payloads we've ever appended,
-        // keyed by global index. Only populated when dedup is on — otherwise the heap retention
-        // (every chunk packet kept until the combine finishes) blows up on long replays.
-        private final List<byte[]> packetsByIndex;
 
-        CacheWriter(ZipOutputStream out, boolean retainForDedup) {
+        CacheWriter(ZipOutputStream out) {
             this.out = out;
-            this.retainForDedup = retainForDedup;
-            this.packetsByIndex = retainForDedup ? new ArrayList<>() : null;
         }
 
         int appendAndReturnIndex(byte[] packet) throws IOException {
@@ -583,27 +567,8 @@ public class ReplayCombiner {
             sizeHeader[3] = (byte) len;
             out.write(sizeHeader);
             out.write(packet);
-            if (retainForDedup) {
-                packetsByIndex.add(packet);
-            }
             totalCount++;
             return idx;
-        }
-
-        boolean equalsAt(int globalIndex, byte[] candidate) {
-            if (!retainForDedup || globalIndex < 0 || globalIndex >= packetsByIndex.size()) {
-                return false;
-            }
-            byte[] stored = packetsByIndex.get(globalIndex);
-            if (stored.length != candidate.length) {
-                return false;
-            }
-            for (int i = 0; i < stored.length; i++) {
-                if (stored[i] != candidate[i]) {
-                    return false;
-                }
-            }
-            return true;
         }
 
         void flushFinalBucket() throws IOException {
@@ -611,6 +576,15 @@ public class ReplayCombiner {
                 out.closeEntry();
                 entryOpen = false;
             }
+        }
+    }
+
+    private static MessageDigest newSha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is mandated by the JLS-bound JCA — every JVM has it.
+            throw new IllegalStateException(e);
         }
     }
 
