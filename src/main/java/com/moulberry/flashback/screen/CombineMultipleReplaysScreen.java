@@ -1,20 +1,18 @@
 package com.moulberry.flashback.screen;
 
 import com.moulberry.flashback.Flashback;
+import com.moulberry.flashback.RegistryMetaHelper;
 import com.moulberry.flashback.exporting.AsyncFileDialogs;
 import com.moulberry.flashback.io.ReplayCombiner;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.Checkbox;
 import net.minecraft.client.gui.components.EditBox;
-import net.minecraft.client.gui.components.StringWidget;
-import net.minecraft.client.gui.layouts.FrameLayout;
-import net.minecraft.client.gui.layouts.GridLayout;
 import net.minecraft.client.gui.screens.AlertScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
-import net.minecraft.util.Mth;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
@@ -22,6 +20,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
@@ -29,17 +29,33 @@ import java.util.stream.Stream;
 
 public class CombineMultipleReplaysScreen extends Screen {
 
-    private static final int TOTAL_WIDTH = 300;
-    private static final int VISIBLE_SOURCES = 6;
+    private static final int CONTROL_WIDTH = 300;
+    private static final int ITEM_HEIGHT = 36;
 
     @Nullable
     private final Screen lastScreen;
+    private final LinkedHashMap<String, LinkedHashSet<String>> currentNamespacesForRegistries;
 
     private String newReplayName = "Combined Replay";
     private final List<Path> sources = new ArrayList<>();
+    @Nullable
     private Path output;
     private boolean dedupeChunkCaches = false;
-    private int sourceScrollOffset = 0;
+
+    @Nullable
+    private CombineSourceList list;
+    @Nullable
+    private Button moveUpButton;
+    @Nullable
+    private Button moveDownButton;
+    @Nullable
+    private Button removeButton;
+    @Nullable
+    private Button clearAllButton;
+    @Nullable
+    private Button outputButton;
+    @Nullable
+    private Button combineButton;
 
     public CombineMultipleReplaysScreen(@Nullable Screen lastScreen) {
         this(lastScreen, null);
@@ -48,6 +64,7 @@ public class CombineMultipleReplaysScreen extends Screen {
     public CombineMultipleReplaysScreen(@Nullable Screen lastScreen, @Nullable Path firstSource) {
         super(Component.translatable("flashback.combine_replay.multiple"));
         this.lastScreen = lastScreen;
+        this.currentNamespacesForRegistries = RegistryMetaHelper.calculateNamespacesForRegistries();
         if (firstSource != null) {
             this.sources.add(firstSource);
         }
@@ -61,182 +78,188 @@ public class CombineMultipleReplaysScreen extends Screen {
     protected void init() {
         super.init();
 
-        clampScrollOffset();
+        Path replayFolder = Flashback.getReplayFolder();
 
-        GridLayout gridLayout = new GridLayout();
-        gridLayout.defaultCellSetting().padding(4, 4, 4, 0);
-        GridLayout.RowHelper rowHelper = gridLayout.createRowHelper(6);
+        int centerX = this.width / 2;
+        int controlLeft = centerX - CONTROL_WIDTH / 2;
 
-        rowHelper.addChild(new StringWidget(TOTAL_WIDTH, 20, Component.translatable("flashback.combine_replay.multiple"), this.font), 6);
+        int topY = 30;
 
-        rowHelper.addChild(new BottomTextWidget(TOTAL_WIDTH, 10, Component.translatable("flashback.combine_replay.new_replay_name"), this.font).alignLeft(), 6);
-
-        EditBox replayNameEditBox = new EditBox(this.font, 0, 0, TOTAL_WIDTH, 20, Component.literal(this.newReplayName));
+        EditBox replayNameEditBox = new EditBox(this.font, controlLeft, topY, CONTROL_WIDTH, 20, Component.literal(this.newReplayName));
         replayNameEditBox.setMaxLength(128);
         replayNameEditBox.setValue(this.newReplayName);
         replayNameEditBox.setResponder(s -> this.newReplayName = s);
-        rowHelper.addChild(replayNameEditBox, 6);
-
-        int total = this.sources.size();
-        Component sourcesLabel;
-        if (total <= VISIBLE_SOURCES) {
-            sourcesLabel = Component.translatable("flashback.combine_replay.sources");
-        } else {
-            int from = this.sourceScrollOffset + 1;
-            int to = Math.min(this.sourceScrollOffset + VISIBLE_SOURCES, total);
-            sourcesLabel = Component.translatable("flashback.combine_replay.sources_window", from, to, total);
-        }
-        rowHelper.addChild(new BottomTextWidget(TOTAL_WIDTH, 10, sourcesLabel, this.font).alignLeft(), 6);
-
-        Path replayFolder = Flashback.getReplayFolder();
-
-        int windowStart = this.sourceScrollOffset;
-        int windowEnd = Math.min(windowStart + VISIBLE_SOURCES, total);
-
-        for (int i = windowStart; i < windowEnd; i++) {
-            final int index = i;
-            Path src = this.sources.get(i);
-
-            rowHelper.addChild(new StringWidget(20, 20, Component.literal(Integer.toString(i + 1)), this.font), 1);
-
-            String label = src.getFileName() == null ? src.toString() : src.getFileName().toString();
-            rowHelper.addChild(Button.builder(Component.literal(label), b -> {
-                CompletableFuture<String> future = AsyncFileDialogs.openFileDialog(replayFolder.toString(), "Replay Archive", "zip");
-                future.thenAccept(pathStr -> {
-                    if (pathStr != null) {
-                        this.sources.set(index, Path.of(pathStr));
-                        this.rebuild();
-                    }
-                });
-            }).width(150).build(), 3);
-
-            Button upButton = Button.builder(Component.literal("▲"), b -> {
-                if (index > 0) {
-                    Path tmp = this.sources.get(index - 1);
-                    this.sources.set(index - 1, this.sources.get(index));
-                    this.sources.set(index, tmp);
-                    this.rebuild();
-                }
-            }).width(20).build();
-            upButton.active = (i > 0);
-            rowHelper.addChild(upButton, 1);
-
-            Button downButton = Button.builder(Component.literal("▼"), b -> {
-                if (index < this.sources.size() - 1) {
-                    Path tmp = this.sources.get(index + 1);
-                    this.sources.set(index + 1, this.sources.get(index));
-                    this.sources.set(index, tmp);
-                    this.rebuild();
-                }
-            }).width(20).build();
-            downButton.active = (i < this.sources.size() - 1);
-            rowHelper.addChild(downButton, 1);
-
-            Button removeButton = Button.builder(Component.literal("×"), b -> {
-                this.sources.remove(index);
-                this.rebuild();
-            }).width(20).build();
-            rowHelper.addChild(removeButton, 1);
-        }
-
-        // Pad empty source slots so the layout below stays put when the list is short.
-        int emptySlots = VISIBLE_SOURCES - (windowEnd - windowStart);
-        for (int i = 0; i < emptySlots; i++) {
-            rowHelper.addChild(new StringWidget(TOTAL_WIDTH, 20, Component.literal(""), this.font), 6);
-        }
-
-        rowHelper.addChild(Button.builder(Component.translatable("flashback.combine_replay.add_source"), b -> {
-            CompletableFuture<String> future = AsyncFileDialogs.openFileDialog(replayFolder.toString(), "Replay Archive", "zip");
-            future.thenAccept(pathStr -> {
-                if (pathStr != null) {
-                    this.sources.add(Path.of(pathStr));
-                    this.sourceScrollOffset = Math.max(0, this.sources.size() - VISIBLE_SOURCES);
-                    this.rebuild();
-                }
-            });
-        }).width(145).build(), 3);
-        rowHelper.addChild(Button.builder(Component.translatable("flashback.combine_replay.add_directory"), b -> {
-            CompletableFuture<String> future = AsyncFileDialogs.openFolderDialog(replayFolder.toString());
-            future.thenAccept(pathStr -> {
-                if (pathStr != null) {
-                    this.addZipsFromDirectory(Path.of(pathStr));
-                }
-            });
-        }).width(145).build(), 3);
-
-        Button clearAll = Button.builder(Component.translatable("flashback.combine_replay.clear_all"), b -> {
-            this.sources.clear();
-            this.sourceScrollOffset = 0;
-            this.rebuild();
-        }).width(TOTAL_WIDTH).build();
-        clearAll.active = !this.sources.isEmpty();
-        rowHelper.addChild(clearAll, 6);
-
-        rowHelper.addChild(new BottomTextWidget(TOTAL_WIDTH, 10, Component.literal(""), this.font), 6);
+        replayNameEditBox.setHint(Component.translatable("flashback.combine_replay.new_replay_name"));
+        this.addRenderableWidget(replayNameEditBox);
 
         Checkbox dedupeCheckbox = Checkbox.builder(Component.translatable("flashback.combine_replay.dedupe_chunk_caches"), this.font)
+            .pos(controlLeft, topY + 24)
             .selected(this.dedupeChunkCaches)
             .onValueChange((c, value) -> this.dedupeChunkCaches = value)
             .build();
-        rowHelper.addChild(dedupeCheckbox, 6);
+        this.addRenderableWidget(dedupeCheckbox);
 
-        rowHelper.addChild(new BottomTextWidget(TOTAL_WIDTH, 10, Component.translatable("flashback.combine_replay.output"), this.font).alignLeft(), 6);
+        int listTop = topY + 24 + 24;
+        int bottomPanelHeight = 24 * 4;
+        int listHeight = Math.max(ITEM_HEIGHT, this.height - listTop - bottomPanelHeight - 8);
 
-        String outputLabel = this.output == null ? "" : this.output.toString();
-        Button outputButton = Button.builder(Component.literal(outputLabel), b -> {
+        Path previouslySelected = this.list != null && this.list.getSelected() != null
+            ? this.list.getSelected().getPath()
+            : null;
+
+        this.list = new CombineSourceList(this, this.minecraft, this.width, listHeight, listTop, ITEM_HEIGHT, this.currentNamespacesForRegistries);
+        this.list.refreshFromSources(this.sources);
+        if (previouslySelected != null) {
+            this.list.selectByPath(previouslySelected);
+        }
+        this.addRenderableWidget(this.list);
+
+        int bottomY = this.height - bottomPanelHeight - 4;
+
+        int actionButtonWidth = (CONTROL_WIDTH - 8) / 3;
+        this.moveUpButton = Button.builder(Component.translatable("flashback.combine_replay.move_up"), b -> this.moveSelected(-1))
+            .bounds(controlLeft, bottomY, actionButtonWidth, 20).build();
+        this.moveDownButton = Button.builder(Component.translatable("flashback.combine_replay.move_down"), b -> this.moveSelected(1))
+            .bounds(controlLeft + actionButtonWidth + 4, bottomY, actionButtonWidth, 20).build();
+        this.removeButton = Button.builder(Component.translatable("flashback.combine_replay.remove"), b -> this.removeSelected())
+            .bounds(controlLeft + 2 * (actionButtonWidth + 4), bottomY, actionButtonWidth, 20).build();
+        this.addRenderableWidget(this.moveUpButton);
+        this.addRenderableWidget(this.moveDownButton);
+        this.addRenderableWidget(this.removeButton);
+
+        int addButtonWidth = (CONTROL_WIDTH - 8) / 3;
+        Button addSourceButton = Button.builder(Component.translatable("flashback.combine_replay.add_source"), b -> {
+            CompletableFuture<String> future = AsyncFileDialogs.openFileDialog(replayFolder.toString(), "Replay Archive", "zip");
+            future.thenAccept(pathStr -> {
+                if (pathStr != null) {
+                    this.minecraft.execute(() -> this.addSource(Path.of(pathStr)));
+                }
+            });
+        }).bounds(controlLeft, bottomY + 24, addButtonWidth, 20).build();
+        Button addDirectoryButton = Button.builder(Component.translatable("flashback.combine_replay.add_directory"), b -> {
+            CompletableFuture<String> future = AsyncFileDialogs.openFolderDialog(replayFolder.toString());
+            future.thenAccept(pathStr -> {
+                if (pathStr != null) {
+                    this.minecraft.execute(() -> this.addZipsFromDirectory(Path.of(pathStr)));
+                }
+            });
+        }).bounds(controlLeft + addButtonWidth + 4, bottomY + 24, addButtonWidth, 20).build();
+        this.clearAllButton = Button.builder(Component.translatable("flashback.combine_replay.clear_all"), b -> this.clearAllSources())
+            .bounds(controlLeft + 2 * (addButtonWidth + 4), bottomY + 24, addButtonWidth, 20).build();
+        this.addRenderableWidget(addSourceButton);
+        this.addRenderableWidget(addDirectoryButton);
+        this.addRenderableWidget(this.clearAllButton);
+
+        Component outputLabelComponent = this.output == null
+            ? Component.translatable("flashback.combine_replay.output")
+            : Component.literal(this.output.toString());
+        this.outputButton = Button.builder(outputLabelComponent, b -> {
             CompletableFuture<String> future = AsyncFileDialogs.saveFileDialog(replayFolder.toString(), "combined.zip", "Replay Archive", "zip");
             future.thenAccept(pathStr -> {
                 if (pathStr != null) {
-                    this.output = Path.of(pathStr);
-                    this.rebuild();
+                    this.minecraft.execute(() -> {
+                        this.output = Path.of(pathStr);
+                        if (this.outputButton != null) {
+                            this.outputButton.setMessage(Component.literal(this.output.toString()));
+                        }
+                        this.updateButtonStatus();
+                    });
                 }
             });
-        }).width(TOTAL_WIDTH).build();
-        rowHelper.addChild(outputButton, 6);
+        }).bounds(controlLeft, bottomY + 48, CONTROL_WIDTH, 20).build();
+        this.addRenderableWidget(this.outputButton);
 
-        rowHelper.addChild(new BottomTextWidget(TOTAL_WIDTH, 10, Component.literal(""), this.font), 6);
+        int finalButtonWidth = (CONTROL_WIDTH - 4) / 2;
+        this.combineButton = Button.builder(Component.translatable("flashback.combine_replay.do_combine"), b -> this.runCombine())
+            .bounds(controlLeft, bottomY + 72, finalButtonWidth, 20).build();
+        Button cancelButton = Button.builder(CommonComponents.GUI_CANCEL, b -> Minecraft.getInstance().setScreen(this.lastScreen))
+            .bounds(controlLeft + finalButtonWidth + 4, bottomY + 72, finalButtonWidth, 20).build();
+        this.addRenderableWidget(this.combineButton);
+        this.addRenderableWidget(cancelButton);
 
-        Button combineButton = Button.builder(Component.translatable("flashback.combine_replay.do_combine"), b -> this.runCombine())
-            .width(145).build();
-        combineButton.active = this.sources.size() >= 2 && this.output != null;
-        rowHelper.addChild(combineButton, 3);
-        rowHelper.addChild(Button.builder(CommonComponents.GUI_CANCEL, b -> Minecraft.getInstance().setScreen(this.lastScreen))
-            .width(145).build(), 3);
-
-        gridLayout.arrangeElements();
-        FrameLayout.alignInRectangle(gridLayout, 0, 0, this.width, this.height, 0.5f, 0.5f);
-        gridLayout.visitWidgets(this::addRenderableWidget);
+        this.updateButtonStatus();
 
         this.setInitialFocus(replayNameEditBox);
     }
 
+    public void updateButtonStatus() {
+        int selectedIndex = this.list == null ? -1 : this.list.indexOfSelected();
+        boolean hasSelection = selectedIndex >= 0;
+        int size = this.sources.size();
+
+        if (this.moveUpButton != null) {
+            this.moveUpButton.active = hasSelection && selectedIndex > 0;
+        }
+        if (this.moveDownButton != null) {
+            this.moveDownButton.active = hasSelection && selectedIndex < size - 1;
+        }
+        if (this.removeButton != null) {
+            this.removeButton.active = hasSelection;
+        }
+        if (this.clearAllButton != null) {
+            this.clearAllButton.active = !this.sources.isEmpty();
+        }
+        if (this.combineButton != null) {
+            this.combineButton.active = this.sources.size() >= 2 && this.output != null;
+        }
+    }
+
     @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
-        if (this.sources.size() > VISIBLE_SOURCES && scrollY != 0) {
-            int delta = scrollY > 0 ? -1 : 1;
-            int newOffset = Mth.clamp(this.sourceScrollOffset + delta, 0, this.sources.size() - VISIBLE_SOURCES);
-            if (newOffset != this.sourceScrollOffset) {
-                this.sourceScrollOffset = newOffset;
-                this.rebuild();
-                return true;
-            }
-        }
-        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        super.render(guiGraphics, mouseX, mouseY, partialTick);
+        guiGraphics.drawCenteredString(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
     }
 
-    private void clampScrollOffset() {
-        int max = Math.max(0, this.sources.size() - VISIBLE_SOURCES);
-        if (this.sourceScrollOffset > max) {
-            this.sourceScrollOffset = max;
+    private void addSource(Path path) {
+        this.sources.add(path);
+        if (this.list != null) {
+            this.list.refreshFromSources(this.sources);
+            this.list.scrollToBottom();
+            this.list.selectByPath(path);
         }
-        if (this.sourceScrollOffset < 0) {
-            this.sourceScrollOffset = 0;
-        }
+        this.updateButtonStatus();
     }
 
-    private void rebuild() {
-        this.clearWidgets();
-        this.init();
+    private void clearAllSources() {
+        this.sources.clear();
+        if (this.list != null) {
+            this.list.refreshFromSources(this.sources);
+        }
+        this.updateButtonStatus();
+    }
+
+    private void moveSelected(int delta) {
+        if (this.list == null) {
+            return;
+        }
+        int index = this.list.indexOfSelected();
+        if (index < 0) {
+            return;
+        }
+        int target = index + delta;
+        if (target < 0 || target >= this.sources.size()) {
+            return;
+        }
+        Path moved = this.sources.get(index);
+        this.sources.set(index, this.sources.get(target));
+        this.sources.set(target, moved);
+        this.list.refreshFromSources(this.sources);
+        this.list.selectByPath(moved);
+        this.updateButtonStatus();
+    }
+
+    private void removeSelected() {
+        if (this.list == null) {
+            return;
+        }
+        int index = this.list.indexOfSelected();
+        if (index < 0) {
+            return;
+        }
+        this.sources.remove(index);
+        this.list.refreshFromSources(this.sources);
+        this.list.setSelected(null);
+        this.updateButtonStatus();
     }
 
     private void addZipsFromDirectory(Path directory) {
@@ -265,8 +288,11 @@ public class CombineMultipleReplaysScreen extends Screen {
             return;
         }
         this.sources.addAll(zips);
-        this.sourceScrollOffset = Math.max(0, this.sources.size() - VISIBLE_SOURCES);
-        this.rebuild();
+        if (this.list != null) {
+            this.list.refreshFromSources(this.sources);
+            this.list.scrollToBottom();
+        }
+        this.updateButtonStatus();
     }
 
     private void runCombine() {
@@ -282,6 +308,13 @@ public class CombineMultipleReplaysScreen extends Screen {
                 () -> Minecraft.getInstance().setScreen(this.lastScreen),
                 Component.translatable("flashback.combine_replay.error"),
                 Component.literal(e.getMessage() == null ? e.toString() : e.getMessage())));
+        }
+    }
+
+    @Override
+    public void removed() {
+        if (this.list != null) {
+            this.list.children().forEach(CombineSourceEntry::close);
         }
     }
 

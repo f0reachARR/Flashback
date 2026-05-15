@@ -3,12 +3,9 @@
  */
 package com.moulberry.flashback.screen.select_replay;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonObject;
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.SneakyThrow;
-import com.moulberry.flashback.record.FlashbackMeta;
-import com.moulberry.flashback.screen.ReplaySummary;
+import com.moulberry.flashback.screen.ReplaySummaryLoader;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -160,48 +157,8 @@ public class ReplaySelectionList extends ObjectSelectionList<ReplaySelectionEntr
                     continue;
                 }
 
-                futures.add(CompletableFuture.supplyAsync(() -> {
-                    try {
-                        String fileName = path.getFileName().toString();
-
-                        BasicFileAttributeView attributeView = Files.getFileAttributeView(path, BasicFileAttributeView.class);
-                        BasicFileAttributes basicFileAttributes = attributeView.readAttributes();
-
-                        long lastModified = Math.max(basicFileAttributes.creationTime().toMillis(), basicFileAttributes.lastModifiedTime().toMillis());
-                        long filesize = basicFileAttributes.size();
-
-                        byte[] iconBytes = null;
-                        String metadataString = null;
-
-                        try (FileSystem fs = FileSystems.newFileSystem(path)) {
-                            Path iconPath = fs.getPath("/icon.png");
-                            if (Files.exists(iconPath)) {
-                                iconBytes = Files.readAllBytes(iconPath);
-                            }
-
-                            Path metadataPath = fs.getPath("/metadata.json");
-                            if (Files.exists(metadataPath)) {
-                                metadataString = Files.readString(metadataPath);
-                            }
-                        } catch (IOException e) {
-                            SneakyThrow.sneakyThrow(e);
-                        }
-
-                        if (metadataString == null) {
-                            return null;
-                        }
-
-                        JsonObject metadataJson = new Gson().fromJson(metadataString, JsonObject.class);
-                        FlashbackMeta metadata = FlashbackMeta.fromJson(metadataJson);
-                        if (metadata != null) {
-                            ReplaySummary summary = new ReplaySummary(path, metadata, this.currentNamespacesForRegistries, fileName, lastModified, filesize, iconBytes);
-                            return new PendingSelectionEntry.Replay(summary);
-                        }
-                    } catch (IOException e) {
-                        Flashback.LOGGER.error("Failed to load replay", e);
-                    }
-                    return null;
-                }, Util.backgroundExecutor()));
+                futures.add(ReplaySummaryLoader.loadAsync(path, this.currentNamespacesForRegistries)
+                    .thenApply(summary -> (PendingSelectionEntry) (summary == null ? null : new PendingSelectionEntry.Replay(summary))));
             }
         } catch (IOException e) {
             SneakyThrow.sneakyThrow(e);
