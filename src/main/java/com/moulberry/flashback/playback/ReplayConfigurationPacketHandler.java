@@ -120,21 +120,33 @@ public class ReplayConfigurationPacketHandler implements ClientConfigurationPack
             return;
         }
 
+        // Snapshot viewer camera state before everything is (potentially) torn down so the new
+        // ReplayPlayer instances can rebind their spectating targets. Captured before
+        // updateRegistry because that call clears replayServer.replayViewers.
+        if (synchronizeRegistries) {
+            this.replayServer.preserveCameraStateBeforeReconfigure();
+        }
+
         this.replayServer.updateRegistry(currentFeatureFlags, pendingTags, initialPackets, configurationTasks, this.knownPackIds);
 
-        // Remove all players
-        for (ServerPlayer player : new ArrayList<>(this.replayServer.getPlayerList().getPlayers())) {
-            player.discard();
-        }
+        // Only tear down players + levels when the registries actually changed structurally.
+        // For pure feature-flag / chat-reset / tag-only updates the existing player & level
+        // graph is still valid; tearing it down causes a viewer camera reset for no reason.
+        if (synchronizeRegistries) {
+            // Remove all players
+            for (ServerPlayer player : new ArrayList<>(this.replayServer.getPlayerList().getPlayers())) {
+                player.discard();
+            }
 
-        // Remove all levels
-        for (ServerLevel value : this.replayServer.levels.values()) {
-            this.replayServer.closeLevel(value);
-        }
-        this.replayServer.levels.clear();
+            // Remove all levels
+            for (ServerLevel value : this.replayServer.levels.values()) {
+                this.replayServer.closeLevel(value);
+            }
+            this.replayServer.levels.clear();
 
-        // Recreate levels
-        this.replayServer.loadLevel();
+            // Recreate levels
+            this.replayServer.loadLevel();
+        }
     }
 
     private boolean tryUpdateRegistries(List<Registry.PendingTags<?>> pendingTags, ResourceProvider resourceProvider) {

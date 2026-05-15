@@ -150,6 +150,11 @@ public class ReplayServer extends IntegratedServer {
     private StreamCodec<ByteBuf, Packet<? super ClientGamePacketListener>> gamePacketCodec;
     private final StreamCodec<ByteBuf, Packet<? super ClientConfigurationPacketListener>> configurationPacketCodec;
     private final List<ReplayPlayer> replayViewers = new ArrayList<>();
+    // Stash of each viewer's spectating target (recorded entity UUID), keyed by viewer's own UUID.
+    // Populated immediately before flushPendingConfiguration discards all players (registry update
+    // path) so the same viewer reconnecting through configuration → play phase can restore its
+    // camera. Consumed (and cleared) by createPlayer when the replacement ReplayPlayer is built.
+    private final java.util.HashMap<java.util.UUID, java.util.UUID> preservedSpectatingUuids = new java.util.HashMap<>();
     public boolean followLocalPlayerNextTickIfWrongDimension = false;
     private final java.util.WeakHashMap<ReplayPlayer, Boolean> _lastFollowFlagSeen = new java.util.WeakHashMap<>();
     public boolean isProcessingSnapshot = false;
@@ -280,7 +285,48 @@ public class ReplayServer extends IntegratedServer {
         player.setId(newPlayerIds.getAndDecrement());
         player.followLocalPlayerNextTick = true;
         Flashback.LOGGER.info("[viewreset-debug] followLocalPlayerNextTick=true SET at ReplayServer.createPlayer (viewer joined) uuid={}", player.getUUID(), new Throwable("stack"));
+
+        // If this viewer is reconnecting after a registry-driven teardown, restore the spectating
+        // target so the per-tick rebind logic (tickReplayPlayers) picks it back up and re-attaches
+        // the camera. forceRespectateTickCount > 0 makes the rebind fire even if the entity hasn't
+        // re-spawned yet in the new level.
+        java.util.UUID preserved = this.preservedSpectatingUuids.remove(player.getUUID());
+        if (preserved != null) {
+            player.spectatingUuid = preserved;
+            player.spectatingUuidTickCount = 20;
+            player.forceRespectateTickCount = 20;
+            Flashback.LOGGER.info("[viewreset-debug] camera state restored after reconfigure: viewer={} spectatingUuid={}", player.getUUID(), preserved);
+        }
         return player;
+    }
+
+    /**
+     * Capture each viewer's spectating target so it can be restored on the new ReplayPlayer
+     * instance created after the registry-update teardown discards all players. Call right
+     * before discarding players in {@code flushPendingConfiguration}.
+     */
+    public void preserveCameraStateBeforeReconfigure() {
+        this.preservedSpectatingUuids.clear();
+        // Iterate the player list directly rather than `replayViewers` because the cached viewer
+        // list is cleared inside updateRegistry (called earlier in the reconfigure path).
+        for (ServerPlayer sp : this.getPlayerList().getPlayers()) {
+            if (!(sp instanceof ReplayPlayer rv)) {
+                continue;
+            }
+            java.util.UUID target = rv.spectatingUuid;
+            if (target == null) {
+                Entity cam = rv.getCamera();
+                if (cam != null && cam != rv) {
+                    target = cam.getUUID();
+                }
+            }
+            if (target != null) {
+                this.preservedSpectatingUuids.put(rv.getUUID(), target);
+            }
+        }
+        if (!this.preservedSpectatingUuids.isEmpty()) {
+            Flashback.LOGGER.info("[viewreset-debug] preserved {} camera state(s) before reconfigure", this.preservedSpectatingUuids.size());
+        }
     }
 
     @Override
