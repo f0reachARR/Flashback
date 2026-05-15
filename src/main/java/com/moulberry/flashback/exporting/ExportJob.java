@@ -272,12 +272,13 @@ public class ExportJob {
             serverTickTimeNanos += System.nanoTime() - start;
 
             // Tick client
+            clientTickCount = Math.max(((int) tickInfo.clientTick) - 80, clientTickCount);
+
             while (clientTickCount < (int) tickInfo.clientTick) {
                 start = System.nanoTime();
                 this.updateRandoms(random, mathRandom);
                 this.runClientTick(frozen);
                 clientTickTimeNanos += System.nanoTime() - start;
-
                 clientTickCount += 1;
             }
 

@@ -1460,7 +1460,9 @@ public class ReplayServer extends IntegratedServer {
             this.currentTick, dimBefore == null ? "null" : dimBefore.location(), String.join("; ", camerasBefore));
 
         this.clearDataForPlayingSnapshot();
+        Flashback.LOGGER.info("[viewreset-debug] clearDataForPlayingSnapshot");
         replayReader.handleSnapshot(this);
+        Flashback.LOGGER.info("[viewreset-debug] handleSnapshot");
         this.gamePacketHandler.flushPendingEntities();
 
         ResourceKey<Level> dimAfter = this.spawnLevel;

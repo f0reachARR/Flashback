@@ -5,18 +5,25 @@ import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.moulberry.flashback.playback.FakePlayer;
 import com.moulberry.flashback.playback.ReplayServer;
+import io.netty.channel.ChannelFutureListener;
 import net.fabricmc.fabric.impl.event.interaction.FakePlayerNetworkHandler;
+import net.fabricmc.fabric.impl.networking.UntrackedNetworkHandler;
 import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import net.minecraft.server.players.PlayerList;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
+
+import java.util.function.Consumer;
 
 @Mixin(PlayerList.class)
 public class MixinPlayerList {
@@ -29,6 +36,7 @@ public class MixinPlayerList {
     public boolean placeNewPlayer_logInfo(Logger instance, String s, Object[] objects) {
         return !(this.server instanceof ReplayServer);
     }
+
 
     @WrapOperation(method = "placeNewPlayer", at = @At(value = "NEW", target = "(Lnet/minecraft/server/MinecraftServer;Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)Lnet/minecraft/server/network/ServerGamePacketListenerImpl;"))
     public ServerGamePacketListenerImpl placeNewPlayer_newServerGamePacketListener(MinecraftServer minecraftServer, Connection connection, ServerPlayer serverPlayer, CommonListenerCookie commonListenerCookie, Operation<ServerGamePacketListenerImpl> original) {

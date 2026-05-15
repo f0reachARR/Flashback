@@ -5,6 +5,7 @@ import com.moulberry.flashback.ext.ConnectionExt;
 import com.moulberry.flashback.record.IgnoredPacketSet;
 import com.moulberry.flashback.record.Recorder;
 import io.netty.channel.ChannelFutureListener;
+import net.fabricmc.fabric.impl.event.interaction.FakePlayerNetworkHandler;
 import net.minecraft.network.Connection;
 import net.minecraft.network.ConnectionProtocol;
 import net.minecraft.network.PacketListener;
@@ -14,13 +15,17 @@ import net.minecraft.network.protocol.configuration.ClientConfigurationPacketLis
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Connection.class)
-public class MixinConnection implements ConnectionExt {
+public abstract class MixinConnection implements ConnectionExt {
+
+    @Shadow
+    public abstract boolean isConnected();
 
     @Unique
     private boolean filterUnnecessaryPackets = false;
@@ -49,4 +54,9 @@ public class MixinConnection implements ConnectionExt {
         }
     }
 
+    @Inject(method = "flushChannel", at = @At("HEAD"), cancellable = true)
+    public void flushChannel(CallbackInfo ci) {
+        if (!this.isConnected())
+            ci.cancel();
+    }
 }

@@ -713,6 +713,8 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
                 localPlayer.discard();
                 recreatePlayer = true;
             }
+
+            Flashback.LOGGER.info("Recreate player " + this.localPlayerId + " -> " + clientboundLoginPacket.playerId());
         }
 
         this.localPlayerId = clientboundLoginPacket.playerId();

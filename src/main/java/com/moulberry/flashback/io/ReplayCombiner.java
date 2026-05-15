@@ -51,7 +51,7 @@ public class ReplayCombiner {
      * chunk area" and therefore safe to combine into a single output zip.
      * Below this threshold the output is split at the boundary.
      */
-    private static final double SAME_RANGE_JACCARD = 0.90;
+    private static final double SAME_RANGE_JACCARD = 0.97;
 
     /**
      * Backwards-compatible 2-file API. {@code registryAccess} is ignored —
