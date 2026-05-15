@@ -8,18 +8,40 @@ import com.moulberry.flashback.action.ActionConfigurationPacket;
 import com.moulberry.flashback.action.ActionLevelChunkCached;
 import com.moulberry.flashback.action.ActionRegistry;
 import com.moulberry.flashback.playback.ReplayChunkCache;
+import com.moulberry.flashback.playback.ReplayConfigurationPacketHandler;
+import com.moulberry.flashback.registry.RegistryHelper;
 import com.moulberry.flashback.record.FlashbackChunkMeta;
 import com.moulberry.flashback.record.FlashbackMeta;
 import com.moulberry.flashback.record.ReplayMarker;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import it.unimi.dsi.fastutil.ints.Int2IntMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
+import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundUpdateTagsPacket;
+import net.minecraft.network.protocol.configuration.ClientConfigurationPacketListener;
+import net.minecraft.network.protocol.configuration.ClientboundRegistryDataPacket;
+import net.minecraft.network.protocol.configuration.ClientboundResetChatPacket;
+import net.minecraft.network.protocol.configuration.ClientboundSelectKnownPacks;
+import net.minecraft.network.protocol.configuration.ClientboundUpdateEnabledFeaturesPacket;
+import net.minecraft.network.protocol.configuration.ConfigurationProtocols;
+import net.minecraft.resources.RegistryDataLoader;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.packs.resources.ResourceProvider;
+import net.minecraft.server.packs.repository.KnownPack;
+import net.minecraft.tags.TagNetworkSerialization;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.flag.FeatureFlags;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
@@ -35,11 +57,11 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
@@ -94,7 +116,7 @@ public class ReplayCombiner {
         // signature of every input so we can decide where to split before we start
         // writing.
         List<LongSet> chunkSignatures = new ArrayList<>(inputs.size());
-        List<byte[]> configSignatures = new ArrayList<>(inputs.size());
+        List<ConfigState> configSignatures = new ArrayList<>(inputs.size());
         for (Path input : inputs) {
             chunkSignatures.add(computeChunkSignature(input));
             configSignatures.add(computeConfigurationSignature(input));
@@ -286,29 +308,109 @@ public class ReplayCombiner {
     }
 
     /**
-     * SHA-256 digest of the concatenated payloads of every
-     * {@link ActionConfigurationPacket} action found in the first
-     * {@code .flashback} chunk's snapshot section. Returns an empty array if
-     * the replay has no chunks or no configuration actions; see
-     * {@link #configMatches}, which treats an empty signature as wildcard.
+     * Captures the state that {@link ReplayConfigurationPacketHandler} would
+     * accumulate from a replay's snapshot configuration packets. Used to
+     * compare two replays' configurations semantically — equal state means
+     * combining them won't trigger a destructive {@code flushPendingConfiguration}
+     * mid-playback.
+     *
+     * <p>Resource-pack push/pop packets are intentionally ignored: they are
+     * side effects on {@code replayServer} (no state lives on the handler), and
+     * Server Replay split files repeat them identically.
      */
-    private static byte[] computeConfigurationSignature(Path replayPath) throws IOException {
+    private static final class ConfigState {
+        /** {@code null} means "no configuration packets at all" — treated as wildcard. */
+        @Nullable final Map<ResourceKey<? extends Registry<?>>, RegistryDataLoader.NetworkedRegistryData> registries;
+        @Nullable final Map<ResourceKey<? extends Registry<?>>, TagNetworkSerialization.NetworkPayload> tags;
+        @Nullable final FeatureFlagSet features;
+        @Nullable final List<KnownPack> knownPacks;
+        final boolean resetChat;
+        final boolean empty;
+
+        ConfigState() {
+            this.registries = null;
+            this.tags = null;
+            this.features = null;
+            this.knownPacks = null;
+            this.resetChat = false;
+            this.empty = true;
+        }
+
+        ConfigState(Map<ResourceKey<? extends Registry<?>>, RegistryDataLoader.NetworkedRegistryData> registries,
+                    Map<ResourceKey<? extends Registry<?>>, TagNetworkSerialization.NetworkPayload> tags,
+                    FeatureFlagSet features,
+                    List<KnownPack> knownPacks,
+                    boolean resetChat) {
+            this.registries = registries;
+            this.tags = tags;
+            this.features = features;
+            this.knownPacks = knownPacks;
+            this.resetChat = resetChat;
+            this.empty = false;
+        }
+
+        boolean semanticallyEquals(ConfigState other) {
+            // Empty signature on either side is wildcard — a tiny replay with no
+            // recorded snapshot configuration is treated as compatible with anything.
+            if (this.empty || other.empty) return true;
+            if (this.resetChat != other.resetChat) return false;
+            if (!Objects.equals(this.features, other.features)) return false;
+            if (!Objects.equals(this.knownPacks, other.knownPacks)) return false;
+            if (!Objects.equals(this.tags, other.tags)) return false;
+            return registriesEqualSemantic(this.registries, other.registries);
+        }
+    }
+
+    /**
+     * Compare two pending-registry maps semantically using
+     * {@link RegistryHelper#equals}, which decodes entries via their codec so
+     * different binary encodings of the same logical registry compare equal.
+     * Falls back to map equality if loading the {@link RegistryAccess} fails.
+     */
+    private static boolean registriesEqualSemantic(@Nullable Map<ResourceKey<? extends Registry<?>>, RegistryDataLoader.NetworkedRegistryData> a,
+                                                   @Nullable Map<ResourceKey<? extends Registry<?>>, RegistryDataLoader.NetworkedRegistryData> b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return a == b;
+        if (!a.keySet().equals(b.keySet())) return false;
+        if (a.isEmpty()) return true;
+        try {
+            RegistryAccess.Frozen accessA = loadFrozenRegistries(a);
+            RegistryAccess.Frozen accessB = loadFrozenRegistries(b);
+            return RegistryHelper.equals(accessA, accessB, RegistryDataLoader.SYNCHRONIZED_REGISTRIES);
+        } catch (Exception e) {
+            Flashback.LOGGER.warn("Could not run semantic registry comparison ({}); falling back to byte equality on the encoded entries.", e.toString());
+            return Objects.equals(a, b);
+        }
+    }
+
+    private static RegistryAccess.Frozen loadFrozenRegistries(Map<ResourceKey<? extends Registry<?>>, RegistryDataLoader.NetworkedRegistryData> entries) {
+        return RegistryDataLoader.load(entries, ResourceProvider.EMPTY, List.of(), RegistryDataLoader.SYNCHRONIZED_REGISTRIES);
+    }
+
+    /**
+     * Decode every {@link ActionConfigurationPacket} in the first {@code .flashback}
+     * chunk's snapshot and accumulate the same state that
+     * {@link ReplayConfigurationPacketHandler} would build, for semantic
+     * comparison across inputs. Registry resolution is not required for these
+     * packets, so we feed the decoder {@link RegistryAccess#EMPTY}.
+     */
+    private static ConfigState computeConfigurationSignature(Path replayPath) throws IOException {
         try (FileSystem fs = FileSystems.newFileSystem(replayPath)) {
             FlashbackMeta meta = readMetadata(fs);
             if (meta.chunks.isEmpty()) {
-                return new byte[0];
+                return new ConfigState();
             }
             String firstChunkName = meta.chunks.keySet().iterator().next();
             Path chunkPath = fs.getPath("/" + firstChunkName);
             if (!Files.exists(chunkPath)) {
-                return new byte[0];
+                return new ConfigState();
             }
             byte[] bytes = Files.readAllBytes(chunkPath);
             FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(bytes));
 
             int magic = buf.readInt();
             if (magic != Flashback.MAGIC) {
-                return new byte[0];
+                return new ConfigState();
             }
             int actionCount = buf.readVarInt();
             int configurationPacketActionId = -1;
@@ -320,39 +422,63 @@ public class ReplayCombiner {
                 }
             }
             if (configurationPacketActionId == -1) {
-                return new byte[0];
+                return new ConfigState();
             }
             int snapshotSize = buf.readInt();
             if (snapshotSize <= 0) {
-                return new byte[0];
+                return new ConfigState();
             }
             int snapshotEnd = buf.readerIndex() + snapshotSize;
 
-            MessageDigest digest = newSha256();
-            byte[] tmp = new byte[8192];
+            StreamCodec<ByteBuf, Packet<? super ClientConfigurationPacketListener>> codec = ConfigurationProtocols.CLIENTBOUND.codec();
+            Map<ResourceKey<? extends Registry<?>>, RegistryDataLoader.NetworkedRegistryData> registries = new HashMap<>();
+            Map<ResourceKey<? extends Registry<?>>, TagNetworkSerialization.NetworkPayload> tags = new HashMap<>();
+            FeatureFlagSet features = null;
+            List<KnownPack> knownPacks = null;
+            boolean resetChat = false;
             boolean anyFound = false;
+
             while (buf.readerIndex() < snapshotEnd) {
                 int id = buf.readVarInt();
                 int size = buf.readInt();
+                int payloadEnd = buf.readerIndex() + size;
                 if (id == configurationPacketActionId) {
                     anyFound = true;
-                    // Mix in a length prefix so concatenation is unambiguous.
-                    digest.update((byte) (size >>> 24));
-                    digest.update((byte) (size >>> 16));
-                    digest.update((byte) (size >>> 8));
-                    digest.update((byte) size);
-                    int remaining = size;
-                    while (remaining > 0) {
-                        int chunk = Math.min(remaining, tmp.length);
-                        buf.readBytes(tmp, 0, chunk);
-                        digest.update(tmp, 0, chunk);
-                        remaining -= chunk;
+                    RegistryFriendlyByteBuf rbuf = new RegistryFriendlyByteBuf(buf.slice(buf.readerIndex(), size), RegistryAccess.EMPTY);
+                    Packet<? super ClientConfigurationPacketListener> packet;
+                    try {
+                        packet = codec.decode(rbuf);
+                    } catch (Exception e) {
+                        // Decoding failure means we can't perform a reliable semantic
+                        // comparison for this input. Treat the whole configuration as
+                        // unknown so the caller falls back to a wildcard match rather
+                        // than spuriously splitting.
+                        Flashback.LOGGER.warn("Failed to decode configuration packet in {} while computing signature; treating configuration as unknown (won't trigger a split on its own). {}", replayPath.getFileName(), e.toString());
+                        return new ConfigState();
                     }
+                    if (packet instanceof ClientboundRegistryDataPacket p) {
+                        registries.put(p.registry(), new RegistryDataLoader.NetworkedRegistryData(p.entries(), TagNetworkSerialization.NetworkPayload.EMPTY));
+                    } else if (packet instanceof ClientboundUpdateTagsPacket p) {
+                        tags.putAll(p.getTags());
+                    } else if (packet instanceof ClientboundUpdateEnabledFeaturesPacket p) {
+                        features = FeatureFlags.REGISTRY.fromNames(p.features());
+                    } else if (packet instanceof ClientboundSelectKnownPacks p) {
+                        knownPacks = List.copyOf(p.knownPacks());
+                    } else if (packet instanceof ClientboundResetChatPacket) {
+                        resetChat = true;
+                    }
+                    // ResourcePackPush/Pop intentionally ignored — they don't live on the
+                    // handler state and are not part of what `flushPendingConfiguration`
+                    // tears down for.
+                    buf.readerIndex(payloadEnd);
                 } else {
-                    buf.skipBytes(size);
+                    buf.readerIndex(payloadEnd);
                 }
             }
-            return anyFound ? digest.digest() : new byte[0];
+            if (!anyFound) {
+                return new ConfigState();
+            }
+            return new ConfigState(registries, tags, features, knownPacks, resetChat);
         }
     }
 
@@ -394,18 +520,18 @@ public class ReplayCombiner {
      * whose snapshot configuration signatures match exactly. A mismatch on
      * either condition triggers a split with a warning that names the reason.
      */
-    private static List<List<Path>> groupByCompatibility(List<Path> inputs, List<LongSet> chunkSigs, List<byte[]> configSigs) {
+    private static List<List<Path>> groupByCompatibility(List<Path> inputs, List<LongSet> chunkSigs, List<ConfigState> configSigs) {
         List<List<Path>> runs = new ArrayList<>();
         List<Path> current = new ArrayList<>();
         current.add(inputs.get(0));
         LongSet currentChunkSig = chunkSigs.get(0);
-        byte[] currentConfigSig = configSigs.get(0);
+        ConfigState currentConfigSig = configSigs.get(0);
         for (int i = 1; i < inputs.size(); i++) {
             LongSet chunkSig = chunkSigs.get(i);
-            byte[] configSig = configSigs.get(i);
+            ConfigState configSig = configSigs.get(i);
             double similarity = jaccard(currentChunkSig, chunkSig);
             boolean chunkMatches = similarity >= SAME_RANGE_JACCARD;
-            boolean configMatches = configMatches(currentConfigSig, configSig);
+            boolean configMatches = currentConfigSig.semanticallyEquals(configSig);
             if (chunkMatches && configMatches) {
                 current.add(inputs.get(i));
                 // Keep the first non-empty signatures as the run's reference so that
@@ -413,7 +539,7 @@ public class ReplayCombiner {
                 if (currentChunkSig.isEmpty() && !chunkSig.isEmpty()) {
                     currentChunkSig = chunkSig;
                 }
-                if (currentConfigSig.length == 0 && configSig.length != 0) {
+                if (currentConfigSig.empty && !configSig.empty) {
                     currentConfigSig = configSig;
                 }
             } else {
@@ -435,17 +561,6 @@ public class ReplayCombiner {
         }
         runs.add(current);
         return runs;
-    }
-
-    /**
-     * Empty config signature on either side is treated as a wildcard (no
-     * snapshot recorded for that input — typically a tiny replay).
-     */
-    private static boolean configMatches(byte[] a, byte[] b) {
-        if (a.length == 0 || b.length == 0) {
-            return true;
-        }
-        return Arrays.equals(a, b);
     }
 
     /**
