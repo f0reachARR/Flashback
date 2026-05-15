@@ -961,9 +961,17 @@ public class ReplayServer extends IntegratedServer {
             // Ensure replay viewers are still spectating
             if (replayViewer.spectatingUuid != null) {
                 Entity camera = replayViewer.getCamera();
-                if (replayViewer.forceRespectateTickCount > 0 || camera == null || camera == replayViewer || camera.isRemoved()) {
+                boolean cameraGone = camera == null || camera == replayViewer || camera.isRemoved();
+                if (replayViewer.forceRespectateTickCount > 0 || cameraGone) {
                     Entity targetEntity = replayViewer.level().getEntity(replayViewer.spectatingUuid);
                     if (targetEntity != null && !targetEntity.isRemoved()) {
+                        Flashback.LOGGER.info("[viewreset-debug] camera rebind: tick={} viewer={} reason={} spectatingUuid={} -> target={}#{} ({},{},{})",
+                            this.currentTick,
+                            replayViewer.getUUID(),
+                            replayViewer.forceRespectateTickCount > 0 ? "forceRespectate" : "cameraGone",
+                            replayViewer.spectatingUuid,
+                            targetEntity.getType(), targetEntity.getId(),
+                            targetEntity.getX(), targetEntity.getY(), targetEntity.getZ());
                         replayViewer.setCamera(null);
                         replayViewer.setCamera(targetEntity);
                         replayViewer.spectatingUuid = targetEntity.getUUID();
@@ -971,6 +979,10 @@ public class ReplayServer extends IntegratedServer {
                         if (replayViewer.forceRespectateTickCount == 0) {
                             replayViewer.forceRespectateTickCount = 5;
                         }
+                    } else if (cameraGone) {
+                        Flashback.LOGGER.info("[viewreset-debug] camera rebind FAILED: tick={} viewer={} spectatingUuid={} -> target entity not found in level={}",
+                            this.currentTick, replayViewer.getUUID(), replayViewer.spectatingUuid,
+                            replayViewer.level() == null ? "null" : replayViewer.level().dimension().location());
                     }
                 }
             }
@@ -1420,9 +1432,30 @@ public class ReplayServer extends IntegratedServer {
     private void playSnapshot(ReplayReader replayReader) {
         this.processedSnapshot = true;
 
+        ResourceKey<Level> dimBefore = this.spawnLevel;
+        java.util.List<String> camerasBefore = new java.util.ArrayList<>();
+        for (ReplayPlayer rv : this.replayViewers) {
+            Entity cam = rv.getCamera();
+            camerasBefore.add(String.format("viewer=%s level=%s camera=%s spectatingUuid=%s",
+                rv.getUUID(),
+                rv.level() == null ? "null" : rv.level().dimension().location(),
+                cam == null ? "null" : (cam == rv ? "self" : cam.getType() + "#" + cam.getId()),
+                rv.spectatingUuid));
+        }
+        Flashback.LOGGER.info("[viewreset-debug] playSnapshot start: tick={} dimBefore={} viewers=[{}]",
+            this.currentTick, dimBefore == null ? "null" : dimBefore.location(), String.join("; ", camerasBefore));
+
         this.clearDataForPlayingSnapshot();
         replayReader.handleSnapshot(this);
         this.gamePacketHandler.flushPendingEntities();
+
+        ResourceKey<Level> dimAfter = this.spawnLevel;
+        Flashback.LOGGER.info("[viewreset-debug] playSnapshot end: tick={} dimBefore={} dimAfter={} dimensionChanged={} followLocalPlayerNextTickIfWrongDimension={}",
+            this.currentTick,
+            dimBefore == null ? "null" : dimBefore.location(),
+            dimAfter == null ? "null" : dimAfter.location(),
+            !java.util.Objects.equals(dimBefore, dimAfter),
+            this.followLocalPlayerNextTickIfWrongDimension);
 
         replayReader.resetToStart();
     }
@@ -1497,11 +1530,18 @@ public class ReplayServer extends IntegratedServer {
         }
 
         for (ReplayPlayer replayViewer : this.getReplayViewers()) {
-            boolean shouldFollow = replayViewer.followLocalPlayerNextTick;
-            if (this.followLocalPlayerNextTickIfWrongDimension) {
-                shouldFollow |= replayViewer.level() != currentLevel;
-            }
+            boolean wantedByFlag = replayViewer.followLocalPlayerNextTick;
+            boolean wantedByDim = this.followLocalPlayerNextTickIfWrongDimension && replayViewer.level() != currentLevel;
+            boolean shouldFollow = wantedByFlag || wantedByDim;
             if (shouldFollow) {
+                Flashback.LOGGER.info("[viewreset-debug] tryFollowLocalPlayer FORCING teleport: tick={} viewer={} viewerLevel={} currentLevel={} reason={} target=({},{},{}) spectatingUuid={}",
+                    this.currentTick,
+                    replayViewer.getUUID(),
+                    replayViewer.level() == null ? "null" : replayViewer.level().dimension().location(),
+                    currentLevel.dimension().location(),
+                    wantedByFlag && wantedByDim ? "flag+dim" : (wantedByFlag ? "flag" : "dim"),
+                    follow.getX(), follow.getY(), follow.getZ(),
+                    replayViewer.spectatingUuid);
                 replayViewer.followLocalPlayerNextTick = false;
                 replayViewer.teleportTo(currentLevel, follow.getX(), follow.getY(), follow.getZ(), Set.of(),
                     follow.getYRot(), follow.getXRot(), false);

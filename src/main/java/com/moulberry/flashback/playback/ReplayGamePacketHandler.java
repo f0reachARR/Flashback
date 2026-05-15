@@ -776,9 +776,16 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
     private void ensureWorldCreated(CommonPlayerSpawnInfo commonPlayerSpawnInfo, Entity localPlayer, boolean forceReset) {
         ResourceKey<Level> dimension = commonPlayerSpawnInfo.dimension();
 
+        Flashback.LOGGER.info("[viewreset-debug] ensureWorldCreated entry: currentDimension={} newDimension={} forceReset={} localPlayer={}",
+            this.currentDimension == null ? "null" : this.currentDimension.location(),
+            dimension.location(),
+            forceReset,
+            localPlayer == null ? "null" : (localPlayer.getType() + "#" + localPlayer.getId()));
+
         if (forceReset) {
             this.replayServer.clearReplayTempFolder();
             if (this.currentDimension == dimension) {
+                Flashback.LOGGER.info("[viewreset-debug] ensureWorldCreated: forceReset && same dimension -> clearLevel({})", dimension.location());
                 this.replayServer.clearLevel(this.level());
             }
         }
@@ -787,6 +794,9 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
 
         // Force recreate level if the DimensionType has changed
         boolean forceRecreate = oldLevel != null && !oldLevel.dimensionType().equals(commonPlayerSpawnInfo.dimensionType().value());
+        if (forceRecreate) {
+            Flashback.LOGGER.info("[viewreset-debug] ensureWorldCreated: forceRecreate (DimensionType changed) for {}", dimension.location());
+        }
 
         if (oldLevel == null || forceRecreate) {
             ServerLevelData serverLevelData = this.replayServer.worldData.overworldData();
@@ -811,8 +821,11 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
         ((ServerLevelExt) newLevel).flashback$setCanSpawnEntities(false);
         ((ServerLevelExt) newLevel).flashback$setSeedHash(commonPlayerSpawnInfo.seed());
         this.replayServer.followLocalPlayerNextTickIfWrongDimension = true;
+        Flashback.LOGGER.info("[viewreset-debug] ensureWorldCreated: set followLocalPlayerNextTickIfWrongDimension=true (dimension={}, newLevel==oldLevel? {})",
+            dimension.location(), newLevel == oldLevel);
 
         if (newLevel != oldLevel) {
+            Flashback.LOGGER.info("[viewreset-debug] ensureWorldCreated: newLevel != oldLevel -> forcing viewer teleport + followLocalPlayerNextTick=true on all viewers");
             // Move local player and replay viewer
             if (localPlayer != null) {
                 localPlayer.teleportTo(newLevel, 0.0, 0.0, 0.0, Set.of(), 0.0f, 0.0f, true);
