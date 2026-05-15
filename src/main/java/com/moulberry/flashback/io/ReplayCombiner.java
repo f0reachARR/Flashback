@@ -10,7 +10,6 @@ import com.moulberry.flashback.playback.ReplayChunkCache;
 import com.moulberry.flashback.record.FlashbackChunkMeta;
 import com.moulberry.flashback.record.FlashbackMeta;
 import com.moulberry.flashback.record.ReplayMarker;
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import it.unimi.dsi.fastutil.ints.Int2IntMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
@@ -542,16 +541,18 @@ public class ReplayCombiner {
     }
 
     /**
-     * Bucket-aware writer that emits level_chunk_caches/&lt;bucket&gt; entries as
-     * packets are appended. Also retains all written bytes so {@link #equalsAt}
-     * can confirm hash matches when dedup is on.
+     * Bucket-aware writer that streams level_chunk_caches/&lt;bucket&gt; entries
+     * directly to the ZipOutputStream as packets are appended (no per-bucket
+     * heap buffer). Also retains packet bytes so {@link #equalsAt} can confirm
+     * hash matches when dedup is on.
      */
     private static final class CacheWriter {
         private final ZipOutputStream out;
         private final boolean retainForDedup;
+        private final byte[] sizeHeader = new byte[4];
         private int totalCount = 0;
         private int currentBucket = -1;
-        private ByteBuf currentBucketBuf = null;
+        private boolean entryOpen = false;
         // For dedup byte-equality verification: stores all packet payloads we've ever appended,
         // keyed by global index. Only populated when dedup is on — otherwise the heap retention
         // (every chunk packet kept until the combine finishes) blows up on long replays.
@@ -567,14 +568,21 @@ public class ReplayCombiner {
             int idx = totalCount;
             int bucket = idx / ReplayChunkCache.CHUNK_CACHE_SIZE;
             if (bucket != currentBucket) {
-                if (currentBucketBuf != null) {
-                    writeBucketToZip();
+                if (entryOpen) {
+                    out.closeEntry();
+                    entryOpen = false;
                 }
                 currentBucket = bucket;
-                currentBucketBuf = Unpooled.buffer(Math.min(1 << 20, packet.length + 8));
+                out.putNextEntry(new ZipEntry("level_chunk_caches/" + currentBucket));
+                entryOpen = true;
             }
-            currentBucketBuf.writeInt(packet.length);
-            currentBucketBuf.writeBytes(packet);
+            int len = packet.length;
+            sizeHeader[0] = (byte) (len >>> 24);
+            sizeHeader[1] = (byte) (len >>> 16);
+            sizeHeader[2] = (byte) (len >>> 8);
+            sizeHeader[3] = (byte) len;
+            out.write(sizeHeader);
+            out.write(packet);
             if (retainForDedup) {
                 packetsByIndex.add(packet);
             }
@@ -599,19 +607,10 @@ public class ReplayCombiner {
         }
 
         void flushFinalBucket() throws IOException {
-            if (currentBucketBuf != null) {
-                writeBucketToZip();
-                currentBucketBuf = null;
+            if (entryOpen) {
+                out.closeEntry();
+                entryOpen = false;
             }
-        }
-
-        private void writeBucketToZip() throws IOException {
-            int len = currentBucketBuf.writerIndex();
-            byte[] bytes = new byte[len];
-            currentBucketBuf.getBytes(0, bytes);
-            out.putNextEntry(new ZipEntry("level_chunk_caches/" + currentBucket));
-            out.write(bytes);
-            out.closeEntry();
         }
     }
 
