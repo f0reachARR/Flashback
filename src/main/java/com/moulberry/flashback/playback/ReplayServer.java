@@ -151,6 +151,7 @@ public class ReplayServer extends IntegratedServer {
     private final StreamCodec<ByteBuf, Packet<? super ClientConfigurationPacketListener>> configurationPacketCodec;
     private final List<ReplayPlayer> replayViewers = new ArrayList<>();
     public boolean followLocalPlayerNextTickIfWrongDimension = false;
+    private final java.util.WeakHashMap<ReplayPlayer, Boolean> _lastFollowFlagSeen = new java.util.WeakHashMap<>();
     public boolean isProcessingSnapshot = false;
     public List<FlashbackRawCustomPayload> customPacketsInSnapshot = new ArrayList<>();
     private boolean processedSnapshot = false;
@@ -278,6 +279,7 @@ public class ReplayServer extends IntegratedServer {
         ReplayPlayer player = new ReplayPlayer(ReplayServer.this, level, gameProfile, clientInformation);
         player.setId(newPlayerIds.getAndDecrement());
         player.followLocalPlayerNextTick = true;
+        Flashback.LOGGER.info("[viewreset-debug] followLocalPlayerNextTick=true SET at ReplayServer.createPlayer (viewer joined) uuid={}", player.getUUID(), new Throwable("stack"));
         return player;
     }
 
@@ -954,6 +956,18 @@ public class ReplayServer extends IntegratedServer {
             ((MinecraftExt)Minecraft.getInstance()).flashback$applyKeyframes();
         }
 
+        // viewreset-debug: detect any false->true transition of followLocalPlayerNextTick that we
+        // didn't log at its assignment site (e.g. mixin, reflection, missed branch).
+        for (ReplayPlayer rv : this.replayViewers) {
+            boolean now = rv.followLocalPlayerNextTick;
+            Boolean prev = this._lastFollowFlagSeen.get(rv);
+            if (now && (prev == null || !prev)) {
+                Flashback.LOGGER.info("[viewreset-debug] followLocalPlayerNextTick transitioned false->true (viewer={} tick={}) — if no SET log immediately precedes, the write is from outside the known sites",
+                    rv.getUUID(), this.currentTick);
+            }
+            this._lastFollowFlagSeen.put(rv, now);
+        }
+
         this.tryFollowLocalPlayer();
 
         // Update first person data
@@ -1541,7 +1555,8 @@ public class ReplayServer extends IntegratedServer {
                     currentLevel.dimension().location(),
                     wantedByFlag && wantedByDim ? "flag+dim" : (wantedByFlag ? "flag" : "dim"),
                     follow.getX(), follow.getY(), follow.getZ(),
-                    replayViewer.spectatingUuid);
+                    replayViewer.spectatingUuid,
+                    new Throwable("tryFollow stack"));
                 replayViewer.followLocalPlayerNextTick = false;
                 replayViewer.teleportTo(currentLevel, follow.getX(), follow.getY(), follow.getZ(), Set.of(),
                     follow.getYRot(), follow.getXRot(), false);

@@ -834,6 +834,7 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
                 replayViewer.teleportTo(newLevel, replayViewer.getX(), replayViewer.getY(), replayViewer.getZ(), Set.of(),
                     replayViewer.getYRot(), replayViewer.getXRot(), true);
                 replayViewer.followLocalPlayerNextTick = true;
+                Flashback.LOGGER.info("[viewreset-debug] followLocalPlayerNextTick=true SET at ensureWorldCreated (newLevel!=oldLevel) viewer={}", replayViewer.getUUID(), new Throwable("stack"));
             }
 
             this.forceSendChunksDueToMovingPistonShenanigans.clear();
