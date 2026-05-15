@@ -129,7 +129,7 @@ public class ReplayCombiner {
              ZipOutputStream zipOut = new ZipOutputStream(bos)) {
             zipOut.setLevel(Deflater.BEST_SPEED);
 
-            CacheWriter cacheWriter = new CacheWriter(zipOut);
+            CacheWriter cacheWriter = new CacheWriter(zipOut, dedupeChunkCaches);
             // Only populated when dedupeChunkCaches is true.
             HashMap<Long, List<int[]>> seenHashToIndex = dedupeChunkCaches ? new HashMap<>() : null;
             // Buffer reused for hashing if dedup is on.
@@ -278,8 +278,9 @@ public class ReplayCombiner {
     private static LongSet computeChunkSignature(Path replayPath) throws IOException {
         LongOpenHashSet sig = new LongOpenHashSet();
         try (FileSystem fs = FileSystems.newFileSystem(replayPath)) {
-            readEachCachePacket(fs, (localIndex, packetBytes) -> {
-                long packed = readChunkXZFromCachePacket(packetBytes);
+            // We only need the first ~13 bytes (varint packet id up to 5 bytes + 2x int32 chunk coords).
+            readEachCachePacketHeader(fs, 13, (localIndex, headerBytes, headerLen) -> {
+                long packed = readChunkXZFromCachePacket(headerBytes, headerLen);
                 if (packed != Long.MIN_VALUE) {
                     sig.add(packed);
                 }
@@ -294,11 +295,11 @@ public class ReplayCombiner {
      * {@code ClientboundLevelChunkWithLightPacket}). Returns {@link Long#MIN_VALUE}
      * if the packet is malformed / too short.
      */
-    private static long readChunkXZFromCachePacket(byte[] packet) {
+    private static long readChunkXZFromCachePacket(byte[] packet, int len) {
         int p = 0;
         // Skip the varint packet id (max 5 bytes for a 32-bit varint).
         for (int i = 0; i < 5; i++) {
-            if (p >= packet.length) {
+            if (p >= len) {
                 return Long.MIN_VALUE;
             }
             byte b = packet[p++];
@@ -306,7 +307,7 @@ public class ReplayCombiner {
                 break;
             }
         }
-        if (p + 8 > packet.length) {
+        if (p + 8 > len) {
             return Long.MIN_VALUE;
         }
         int chunkX = (packet[p] & 0xff) << 24
@@ -438,15 +439,35 @@ public class ReplayCombiner {
         void accept(int localIndex, byte[] packetBytes) throws IOException;
     }
 
+    @FunctionalInterface
+    private interface CachePacketHeaderConsumer {
+        /** {@code headerBytes} contains at least the first {@code headerLen} bytes of the packet. */
+        void accept(int localIndex, byte[] headerBytes, int headerLen) throws IOException;
+    }
+
     /**
      * Walks the level_chunk_cache (legacy single-file) and level_chunk_caches/0,1,2,...
      * entries, yielding each packet as raw bytes along with its original local index.
      */
     private static void readEachCachePacket(FileSystem fs, CachePacketConsumer consumer) throws IOException {
+        readEachCachePacket0(fs, consumer, null, 0);
+    }
+
+    /**
+     * Walks the cache entries but only reads up to {@code headerLen} bytes of each
+     * packet (the rest is skipped via {@link InputStream#skip}). Used by the
+     * signature pre-pass so we don't materialize full chunk bytes just to read
+     * the (chunkX, chunkZ) header.
+     */
+    private static void readEachCachePacketHeader(FileSystem fs, int headerLen, CachePacketHeaderConsumer consumer) throws IOException {
+        readEachCachePacket0(fs, null, consumer, headerLen);
+    }
+
+    private static void readEachCachePacket0(FileSystem fs, CachePacketConsumer full, CachePacketHeaderConsumer header, int headerLen) throws IOException {
         int localIndex = 0;
         Path legacy = fs.getPath("/level_chunk_cache");
         if (Files.exists(legacy)) {
-            localIndex = readPacketsFromFile(legacy, localIndex, consumer);
+            localIndex = readPacketsFromFile(legacy, localIndex, full, header, headerLen);
         }
         int bucket = 0;
         while (true) {
@@ -462,14 +483,15 @@ public class ReplayCombiner {
                 // fast-forward so the remap keys still match in-stream packet ids.
                 localIndex = expectedStart;
             }
-            localIndex = readPacketsFromFile(path, localIndex, consumer);
+            localIndex = readPacketsFromFile(path, localIndex, full, header, headerLen);
             bucket++;
         }
     }
 
-    private static int readPacketsFromFile(Path path, int startIndex, CachePacketConsumer consumer) throws IOException {
+    private static int readPacketsFromFile(Path path, int startIndex, CachePacketConsumer full, CachePacketHeaderConsumer header, int headerLen) throws IOException {
         int localIndex = startIndex;
         try (InputStream is = Files.newInputStream(path)) {
+            byte[] headerBuf = header != null ? new byte[headerLen] : null;
             while (true) {
                 byte[] sizeBuffer = is.readNBytes(4);
                 if (sizeBuffer.length == 0) {
@@ -483,12 +505,36 @@ public class ReplayCombiner {
                     | (sizeBuffer[1] & 0xff) << 16
                     | (sizeBuffer[2] & 0xff) << 8
                     | sizeBuffer[3] & 0xff;
-                byte[] packet = is.readNBytes(size);
-                if (packet.length < size) {
-                    Flashback.LOGGER.error("Ran out of bytes while reading {}, needed {} got {}", path, size, packet.length);
-                    break;
+                if (full != null) {
+                    byte[] packet = is.readNBytes(size);
+                    if (packet.length < size) {
+                        Flashback.LOGGER.error("Ran out of bytes while reading {}, needed {} got {}", path, size, packet.length);
+                        break;
+                    }
+                    full.accept(localIndex, packet);
+                } else {
+                    int toRead = Math.min(headerLen, size);
+                    int got = is.readNBytes(headerBuf, 0, toRead);
+                    if (got < toRead) {
+                        Flashback.LOGGER.error("Ran out of bytes while reading header in {}, needed {} got {}", path, toRead, got);
+                        break;
+                    }
+                    int remaining = size - toRead;
+                    while (remaining > 0) {
+                        long skipped = is.skip(remaining);
+                        if (skipped <= 0) {
+                            // Fallback for streams that don't honor skip; read & discard.
+                            if (is.read() < 0) {
+                                Flashback.LOGGER.error("Truncated payload while skipping in {}", path);
+                                return localIndex;
+                            }
+                            remaining--;
+                        } else {
+                            remaining -= (int) skipped;
+                        }
+                    }
+                    header.accept(localIndex, headerBuf, got);
                 }
-                consumer.accept(localIndex, packet);
                 localIndex++;
             }
         }
@@ -502,15 +548,19 @@ public class ReplayCombiner {
      */
     private static final class CacheWriter {
         private final ZipOutputStream out;
+        private final boolean retainForDedup;
         private int totalCount = 0;
         private int currentBucket = -1;
         private ByteBuf currentBucketBuf = null;
         // For dedup byte-equality verification: stores all packet payloads we've ever appended,
-        // keyed by global index. Only populated when needed (we always populate, kept simple).
-        private final List<byte[]> packetsByIndex = new ArrayList<>();
+        // keyed by global index. Only populated when dedup is on — otherwise the heap retention
+        // (every chunk packet kept until the combine finishes) blows up on long replays.
+        private final List<byte[]> packetsByIndex;
 
-        CacheWriter(ZipOutputStream out) {
+        CacheWriter(ZipOutputStream out, boolean retainForDedup) {
             this.out = out;
+            this.retainForDedup = retainForDedup;
+            this.packetsByIndex = retainForDedup ? new ArrayList<>() : null;
         }
 
         int appendAndReturnIndex(byte[] packet) throws IOException {
@@ -525,13 +575,15 @@ public class ReplayCombiner {
             }
             currentBucketBuf.writeInt(packet.length);
             currentBucketBuf.writeBytes(packet);
-            packetsByIndex.add(packet);
+            if (retainForDedup) {
+                packetsByIndex.add(packet);
+            }
             totalCount++;
             return idx;
         }
 
         boolean equalsAt(int globalIndex, byte[] candidate) {
-            if (globalIndex < 0 || globalIndex >= packetsByIndex.size()) {
+            if (!retainForDedup || globalIndex < 0 || globalIndex >= packetsByIndex.size()) {
                 return false;
             }
             byte[] stored = packetsByIndex.get(globalIndex);
