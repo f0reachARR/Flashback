@@ -12,7 +12,6 @@ import net.minecraft.client.gui.layouts.FrameLayout;
 import net.minecraft.client.gui.layouts.GridLayout;
 import net.minecraft.client.gui.screens.AlertScreen;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.util.Mth;
@@ -275,8 +274,8 @@ public class CombineMultipleReplaysScreen extends Screen {
             return;
         }
         try {
-            ReplayCombiner.combine(this.newReplayName, List.copyOf(this.sources), this.output, this.dedupeChunkCaches);
-            Minecraft.getInstance().setScreen(new TitleScreen());
+            List<Path> outputs = ReplayCombiner.combine(this.newReplayName, List.copyOf(this.sources), this.output, this.dedupeChunkCaches);
+            CombineReplayResults.afterCombine(outputs, this.lastScreen);
         } catch (Exception e) {
             Flashback.LOGGER.error("Error combining replays", e);
             Minecraft.getInstance().setScreen(new AlertScreen(

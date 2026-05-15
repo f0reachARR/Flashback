@@ -11,7 +11,6 @@ import net.minecraft.client.gui.layouts.FrameLayout;
 import net.minecraft.client.gui.layouts.GridLayout;
 import net.minecraft.client.gui.screens.AlertScreen;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import org.jetbrains.annotations.Nullable;
@@ -121,11 +120,11 @@ public class CombineReplayScreen extends Screen {
 
         rowHelper.addChild(Button.builder(Component.translatable("flashback.combine_replay.do_combine"), button -> {
             try {
-                ReplayCombiner.combine(this.newReplayName,
+                List<Path> outputs = ReplayCombiner.combine(this.newReplayName,
                     List.of(this.firstReplay, this.secondReplay),
                     this.output,
                     false);
-                Minecraft.getInstance().setScreen(new TitleScreen());
+                CombineReplayResults.afterCombine(outputs, this.lastScreen);
             } catch (Exception e) {
                 Flashback.LOGGER.error("Error combining replays", e);
                 Minecraft.getInstance().setScreen(new AlertScreen(() -> Minecraft.getInstance().setScreen(this.lastScreen),

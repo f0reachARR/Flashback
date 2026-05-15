@@ -14,6 +14,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import it.unimi.dsi.fastutil.ints.Int2IntMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.resources.ResourceLocation;
@@ -27,6 +30,7 @@ import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -41,11 +45,25 @@ import java.util.zip.ZipOutputStream;
 public class ReplayCombiner {
 
     /**
-     * Backwards-compatible 2-file API. {@code registryAccess} is ignored —
-     * the combiner no longer needs any registry data.
+     * Minimum Jaccard similarity between the (chunkX, chunkZ) sets of two
+     * adjacent input replays for them to be considered the same "recorded
+     * chunk area" and therefore safe to combine into a single output zip.
+     * Below this threshold the output is split at the boundary.
      */
+    private static final double SAME_RANGE_JACCARD = 0.90;
+
+    /**
+     * Backwards-compatible 2-file API. {@code registryAccess} is ignored —
+     * the combiner no longer needs any registry data. Throws if the inputs
+     * disagree on chunk range and would have been split into multiple outputs;
+     * use {@link #combine(String, List, Path, boolean)} to receive all paths.
+     */
+    @Deprecated
     public static void combine(RegistryAccess registryAccess, String replayName, Path first, Path second, Path output) throws Exception {
-        combine(replayName, List.of(first, second), output, false);
+        List<Path> written = combine(replayName, List.of(first, second), output, false);
+        if (written.size() > 1) {
+            throw new IllegalStateException("Inputs have different chunk ranges; combine produced " + written.size() + " files. Use the List<Path> overload to receive split outputs.");
+        }
     }
 
     /**
@@ -53,13 +71,48 @@ public class ReplayCombiner {
      * (same world, same position, guaranteed continuous). Streams bytes directly
      * without decoding packets, so no {@link RegistryAccess} is required.
      *
+     * <p>If the recorded chunk area changes between consecutive inputs, the
+     * output is split into multiple files (otherwise the combined playback
+     * would silently freeze / desync). With a single output the original
+     * {@code output} path is used; with N outputs the files are named
+     * {@code <stem>_part1.zip}, {@code <stem>_part2.zip}, ...
+     *
      * @param dedupeChunkCaches if true, identical level-chunk packets across the
      *                          inputs share a single output entry (smaller output,
      *                          slightly more CPU/memory for hashing).
+     * @return the paths actually written, in order.
      */
-    public static void combine(String replayName, List<Path> inputs, Path output, boolean dedupeChunkCaches) throws Exception {
-        if (inputs == null || inputs.size() < 2) {
-            throw new IllegalArgumentException("Need at least 2 input replays to combine");
+    public static List<Path> combine(String replayName, List<Path> inputs, Path output, boolean dedupeChunkCaches) throws Exception {
+        if (inputs == null || inputs.isEmpty()) {
+            throw new IllegalArgumentException("Need at least 1 input replay to combine");
+        }
+
+        // Pre-pass: compute the chunk-area signature of every input so we can
+        // decide where to split before we start writing.
+        List<LongSet> signatures = new ArrayList<>(inputs.size());
+        for (Path input : inputs) {
+            signatures.add(computeChunkSignature(input));
+        }
+        List<List<Path>> runs = groupByCompatibility(inputs, signatures);
+
+        List<Path> written = new ArrayList<>(runs.size());
+        for (int i = 0; i < runs.size(); i++) {
+            Path runOutput = derivePartPath(output, i, runs.size());
+            combineGroup(replayName, runs.get(i), runOutput, dedupeChunkCaches);
+            written.add(runOutput);
+        }
+
+        if (runs.size() > 1) {
+            Flashback.LOGGER.info("Split combiner output into {} parts due to chunk-area changes between inputs", runs.size());
+        }
+        return written;
+    }
+
+    private static void combineGroup(String replayName, List<Path> inputs, Path output, boolean dedupeChunkCaches) throws Exception {
+        if (inputs.size() == 1) {
+            // A single-input run is just a renamed copy. No remap needed.
+            Files.copy(inputs.get(0), output, StandardCopyOption.REPLACE_EXISTING);
+            return;
         }
 
         FlashbackMeta combinedMeta = null;
@@ -214,6 +267,135 @@ public class ReplayCombiner {
                 }
             }
         }
+    }
+
+    /**
+     * Scan the level_chunk_caches of an input replay and collect the set of
+     * (chunkX, chunkZ) positions, packed as {@code ((long)x << 32) | (z & 0xffffffffL)}.
+     * Returns an empty set if the input has no cached chunks (e.g. very short replay);
+     * see {@link #jaccard} which treats an empty signature as a wildcard.
+     */
+    private static LongSet computeChunkSignature(Path replayPath) throws IOException {
+        LongOpenHashSet sig = new LongOpenHashSet();
+        try (FileSystem fs = FileSystems.newFileSystem(replayPath)) {
+            readEachCachePacket(fs, (localIndex, packetBytes) -> {
+                long packed = readChunkXZFromCachePacket(packetBytes);
+                if (packed != Long.MIN_VALUE) {
+                    sig.add(packed);
+                }
+            });
+        }
+        return sig;
+    }
+
+    /**
+     * Parse the (chunkX, chunkZ) header of a level_chunk_caches packet.
+     * Format: varint packetId, int32 chunkX, int32 chunkZ, ... (see
+     * {@code ClientboundLevelChunkWithLightPacket}). Returns {@link Long#MIN_VALUE}
+     * if the packet is malformed / too short.
+     */
+    private static long readChunkXZFromCachePacket(byte[] packet) {
+        int p = 0;
+        // Skip the varint packet id (max 5 bytes for a 32-bit varint).
+        for (int i = 0; i < 5; i++) {
+            if (p >= packet.length) {
+                return Long.MIN_VALUE;
+            }
+            byte b = packet[p++];
+            if ((b & 0x80) == 0) {
+                break;
+            }
+        }
+        if (p + 8 > packet.length) {
+            return Long.MIN_VALUE;
+        }
+        int chunkX = (packet[p] & 0xff) << 24
+            | (packet[p + 1] & 0xff) << 16
+            | (packet[p + 2] & 0xff) << 8
+            | packet[p + 3] & 0xff;
+        int chunkZ = (packet[p + 4] & 0xff) << 24
+            | (packet[p + 5] & 0xff) << 16
+            | (packet[p + 6] & 0xff) << 8
+            | packet[p + 7] & 0xff;
+        return ((long) chunkX << 32) | (chunkZ & 0xffffffffL);
+    }
+
+    /**
+     * Walk the inputs in order and split them into maximal consecutive sub-lists
+     * whose adjacent chunk-area signatures meet {@link #SAME_RANGE_JACCARD}.
+     */
+    private static List<List<Path>> groupByCompatibility(List<Path> inputs, List<LongSet> signatures) {
+        List<List<Path>> runs = new ArrayList<>();
+        List<Path> current = new ArrayList<>();
+        current.add(inputs.get(0));
+        LongSet currentSig = signatures.get(0);
+        for (int i = 1; i < inputs.size(); i++) {
+            LongSet sig = signatures.get(i);
+            double similarity = jaccard(currentSig, sig);
+            if (similarity >= SAME_RANGE_JACCARD) {
+                current.add(inputs.get(i));
+                // Keep the first non-empty signature as the run's reference so that
+                // an empty input mid-run doesn't reset the comparison baseline.
+                if (currentSig.isEmpty() && !sig.isEmpty()) {
+                    currentSig = sig;
+                }
+            } else {
+                runs.add(current);
+                current = new ArrayList<>();
+                current.add(inputs.get(i));
+                currentSig = sig;
+            }
+        }
+        runs.add(current);
+        return runs;
+    }
+
+    /**
+     * Jaccard similarity |A∩B| / |A∪B|. Empty signature on either side is
+     * treated as a wildcard (returns 1.0), so a tiny input with no cached
+     * chunks doesn't force a spurious split.
+     */
+    private static double jaccard(LongSet a, LongSet b) {
+        if (a.isEmpty() || b.isEmpty()) {
+            return 1.0;
+        }
+        LongSet smaller = a.size() <= b.size() ? a : b;
+        LongSet larger = smaller == a ? b : a;
+        int intersection = 0;
+        LongIterator it = smaller.iterator();
+        while (it.hasNext()) {
+            if (larger.contains(it.nextLong())) {
+                intersection++;
+            }
+        }
+        int union = a.size() + b.size() - intersection;
+        return union == 0 ? 1.0 : (double) intersection / (double) union;
+    }
+
+    /**
+     * For a single-run combine, return the original output path unchanged.
+     * For multi-run combines, append {@code _partN} before the {@code .zip}
+     * extension (case-insensitive). If the path has no .zip suffix the
+     * suffix is appended verbatim.
+     */
+    private static Path derivePartPath(Path output, int runIndex, int totalRuns) {
+        if (totalRuns <= 1) {
+            return output;
+        }
+        Path parent = output.getParent();
+        String name = output.getFileName().toString();
+        String stem;
+        String ext;
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && name.substring(dot).equalsIgnoreCase(".zip")) {
+            stem = name.substring(0, dot);
+            ext = name.substring(dot);
+        } else {
+            stem = name;
+            ext = "";
+        }
+        String partName = stem + "_part" + (runIndex + 1) + ext;
+        return parent == null ? Path.of(partName) : parent.resolve(partName);
     }
 
     private static boolean isIdentityMap(Int2IntMap remap) {

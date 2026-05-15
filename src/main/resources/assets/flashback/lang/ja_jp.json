@@ -151,6 +151,8 @@
   "flashback.combine_replay.do_combine": "リプレイを結合",
   "flashback.screen_registry_mismatch": "警告: レジストリ不一致",
   "flashback.combine_replay.error": "リプレイを結合できません",
+  "flashback.combine_replay.split_outputs": "リプレイが複数ファイルに分割されました",
+  "flashback.combine_replay.split_outputs_body": "入力間で記録チャンク範囲が変わったため、出力は %s 個のファイルに分割されました:\n%s",
   "flashback.tip_of_the_day": "今日のヒント",
   "flashback.replayui.dont_show_tips": "起動時にヒントを表示しない",
   "flashback.close": "閉じる",

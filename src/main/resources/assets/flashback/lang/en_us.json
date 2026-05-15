@@ -163,6 +163,8 @@
   "flashback.combine_replay.dedupe_chunk_caches": "Deduplicate chunk caches (smaller output, slower)",
   "flashback.screen_registry_mismatch": "WARNING: REGISTRY MISMATCH",
   "flashback.combine_replay.error": "Unable to combine replays",
+  "flashback.combine_replay.split_outputs": "Replays split across multiple files",
+  "flashback.combine_replay.split_outputs_body": "The recorded chunk area changed between inputs, so the output was split into %s files:\n%s",
   "flashback.tip_of_the_day": "Tip of the day",
   "flashback.replayui.dont_show_tips": "Don't show tips on startup",
   "flashback.close": "Close",
